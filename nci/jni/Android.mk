@@ -6,7 +6,6 @@ LOCAL_PATH := $(call my-dir)
 include $(CLEAR_VARS)
 LOCAL_PRELINK_MODULE := false
 include $(call all-makefiles-under,$(LOCAL_PATH))
-
 LOCAL_ADDITIONAL_DEPENDENCIES := $(LOCAL_PATH)/Android.mk
 
 ifneq ($(NCI_VERSION),)
