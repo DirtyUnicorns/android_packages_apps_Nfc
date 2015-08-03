@@ -5,6 +5,9 @@ NFC := $(VOB_COMPONENTS)/nfc
 LOCAL_PATH := $(call my-dir)
 include $(CLEAR_VARS)
 LOCAL_PRELINK_MODULE := false
+include $(call all-makefiles-under,$(LOCAL_PATH))
+
+LOCAL_ADDITIONAL_DEPENDENCIES := $(LOCAL_PATH)/Android.mk
 
 ifneq ($(NCI_VERSION),)
 LOCAL_CFLAGS += -DNCI_VERSION=$(NCI_VERSION) -O0 -g
@@ -19,7 +22,7 @@ $(patsubst ./%,%, \
  )
 endef
 
-LOCAL_SRC_FILES:= $(call all-cpp-files-under, .)
+LOCAL_SRC_FILES = $(call all-cpp-files-under, .) $(call all-c-files-under, .)
 
 LOCAL_C_INCLUDES += \
     bionic \

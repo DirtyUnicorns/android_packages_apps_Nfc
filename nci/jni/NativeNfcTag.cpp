@@ -34,8 +34,10 @@ extern "C"
 {
     #include "nfa_api.h"
     #include "nfa_rw_api.h"
+    #include "nfc_brcm_defs.h"
     #include "ndef_utils.h"
     #include "rw_api.h"
+    #include "phNxpExtns.h"
 }
 namespace android
 {
@@ -113,7 +115,7 @@ static bool         sIsTagPresent = true;
 static tNFA_STATUS  sMakeReadonlyStatus = NFA_STATUS_FAILED;
 static jboolean     sMakeReadonlyWaitingForComplete = JNI_FALSE;
 static int          sCurrentConnectedTargetType = TARGET_TYPE_UNKNOWN;
-
+static int          sCurrentConnectedTargetProtocol = NFC_PROTOCOL_UNKNOWN;
 static int reSelect (tNFA_INTF_TYPE rfInterface, bool fSwitchIfNeeded);
 static bool switchRfInterface(tNFA_INTF_TYPE rfInterface);
 
@@ -153,6 +155,7 @@ void nativeNfcTag_abortWaits ()
     sem_post (&sMakeReadonlySem);
     sCurrentRfInterface = NFA_INTERFACE_ISO_DEP;
     sCurrentConnectedTargetType = TARGET_TYPE_UNKNOWN;
+    sCurrentConnectedTargetProtocol = NFC_PROTOCOL_UNKNOWN;
 }
 
 /*******************************************************************************
@@ -182,6 +185,21 @@ void nativeNfcTag_doReadCompleted (tNFA_STATUS status)
     }
     SyncEventGuard g (sReadEvent);
     sReadEvent.notifyOne ();
+}
+
+
+/*******************************************************************************
+**
+** Function:        nativeNfcTag_setRfInterface
+**
+** Description:     Set rf interface.
+**
+** Returns:         void
+**
+*******************************************************************************/
+void nativeNfcTag_setRfInterface (tNFA_INTF_TYPE rfInterface)
+{
+    sCurrentRfInterface = rfInterface;
 }
 
 
@@ -255,7 +273,14 @@ static jbyteArray nativeNfcTag_doRead (JNIEnv* e, jobject)
         {
             SyncEventGuard g (sReadEvent);
             sIsReadingNdefMessage = true;
-            status = NFA_RwReadNDef ();
+            if (sCurrentConnectedTargetProtocol == NFA_PROTOCOL_MIFARE)
+            {
+                status = EXTNS_MfcReadNDef ();
+            }
+            else
+            {
+                status = NFA_RwReadNDef ();
+            }
             sReadEvent.wait (); //wait for NFA_READ_CPLT_EVT
         }
         sIsReadingNdefMessage = false;
@@ -370,7 +395,37 @@ static jboolean nativeNfcTag_doWrite (JNIEnv* e, jobject, jbyteArray buf)
             ALOGD ("%s: try format", __FUNCTION__);
             sem_init (&sFormatSem, 0, 0);
             sFormatOk = false;
-            status = NFA_RwFormatTag ();
+            if (sCurrentConnectedTargetProtocol == NFA_PROTOCOL_MIFARE)
+            {
+                static uint8_t mfc_key1[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+                static uint8_t mfc_key2[6] = {0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7};
+
+                status = EXTNS_MfcFormatTag (mfc_key1, sizeof(mfc_key1));
+                if (status != NFA_STATUS_OK)
+                {
+                    ALOGE ("%s: can't format mifare classic tag", __FUNCTION__);
+                    sem_destroy (&sFormatSem);
+                    goto TheEnd;
+                }
+
+                if (sFormatOk == false) //if format operation failed
+                {
+                    sem_wait (&sFormatSem);
+                    sem_destroy (&sFormatSem);
+                    sem_init (&sFormatSem, 0, 0);
+                    status = EXTNS_MfcFormatTag (mfc_key2, sizeof(mfc_key2));
+                    if (status != NFA_STATUS_OK)
+                    {
+                        ALOGE ("%s: can't format mifare classic tag", __FUNCTION__);
+                        sem_destroy (&sFormatSem);
+                        goto TheEnd;
+                    }
+                }
+            }
+            else
+            {
+                status = NFA_RwFormatTag ();
+            }
             sem_wait (&sFormatSem);
             sem_destroy (&sFormatSem);
             if (sFormatOk == false) //if format operation failed
@@ -385,12 +440,26 @@ static jboolean nativeNfcTag_doWrite (JNIEnv* e, jobject, jbyteArray buf)
         NDEF_MsgInit (buffer, maxBufferSize, &curDataSize);
         status = NDEF_MsgAddRec (buffer, maxBufferSize, &curDataSize, NDEF_TNF_EMPTY, NULL, 0, NULL, 0, NULL, 0);
         ALOGD ("%s: create empty ndef msg; status=%u; size=%lu", __FUNCTION__, status, curDataSize);
-        status = NFA_RwWriteNDef (buffer, curDataSize);
+        if (sCurrentConnectedTargetProtocol == NFA_PROTOCOL_MIFARE)
+        {
+            status = EXTNS_MfcWriteNDef (buffer, curDataSize);
+        }
+        else
+        {
+            status = NFA_RwWriteNDef (buffer, curDataSize);
+        }
     }
     else
     {
         ALOGD ("%s: NFA_RwWriteNDef", __FUNCTION__);
-        status = NFA_RwWriteNDef (p_data, bytes.size());
+        if (sCurrentConnectedTargetProtocol == NFA_PROTOCOL_MIFARE)
+        {
+            status = EXTNS_MfcWriteNDef (p_data, bytes.size());
+        }
+        else
+        {
+            status = NFA_RwWriteNDef (p_data, bytes.size());
+        }
     }
 
     if (status != NFA_STATUS_OK)
@@ -433,6 +502,13 @@ TheEnd:
 *******************************************************************************/
 void nativeNfcTag_doConnectStatus (jboolean isConnectOk)
 {
+    if (EXTNS_GetConnectFlag () == TRUE)
+    {
+        EXTNS_MfcActivated ();
+        EXTNS_SetConnectFlag (FALSE);
+        return;
+    }
+
     if (sConnectWaitingForComplete != JNI_FALSE)
     {
         sConnectWaitingForComplete = JNI_FALSE;
@@ -454,6 +530,13 @@ void nativeNfcTag_doConnectStatus (jboolean isConnectOk)
 *******************************************************************************/
 void nativeNfcTag_doDeactivateStatus (int status)
 {
+    if (EXTNS_GetDeactivateFlag () == TRUE)
+    {
+        EXTNS_MfcDisconnect ();
+        EXTNS_SetDeactivateFlag (FALSE);
+        return;
+    }
+
     sGotDeactivate = (status == 0);
 
     SyncEventGuard g (sReconnectEvent);
@@ -495,16 +578,18 @@ static jint nativeNfcTag_doConnect (JNIEnv*, jobject, jint targetHandle)
     }
 
     sCurrentConnectedTargetType = natTag.mTechList[i];
-    if (natTag.mTechLibNfcTypes[i] != NFC_PROTOCOL_ISO_DEP)
+    sCurrentConnectedTargetProtocol = natTag.mTechLibNfcTypes[i];
+
+    if (sCurrentConnectedTargetProtocol != NFC_PROTOCOL_ISO_DEP)
     {
-        ALOGD ("%s() Nfc type = %d, do nothing for non ISO_DEP", __FUNCTION__, natTag.mTechLibNfcTypes[i]);
+        ALOGD ("%s() Nfc type = %d, do nothing for non ISO_DEP", __FUNCTION__, sCurrentConnectedTargetProtocol);
         retCode = NFCSTATUS_SUCCESS;
         goto TheEnd;
     }
 
-    if (natTag.mTechList[i] == TARGET_TYPE_ISO14443_3A || natTag.mTechList[i] == TARGET_TYPE_ISO14443_3B)
+    if (sCurrentConnectedTargetType == TARGET_TYPE_ISO14443_3A || sCurrentConnectedTargetType == TARGET_TYPE_ISO14443_3B)
     {
-        ALOGD ("%s: switching to tech: %d need to switch rf intf to frame", __FUNCTION__, natTag.mTechList[i]);
+        ALOGD ("%s: switching to tech: %d need to switch rf intf to frame", __FUNCTION__, sCurrentConnectedTargetType);
         retCode = switchRfInterface(NFA_INTERFACE_FRAME) ? NFA_STATUS_OK : NFA_STATUS_FAILED;
     }
     else
@@ -516,6 +601,7 @@ TheEnd:
     ALOGD ("%s: exit 0x%X", __FUNCTION__, retCode);
     return retCode;
 }
+
 
 /*******************************************************************************
 **
@@ -648,7 +734,7 @@ static bool switchRfInterface (tNFA_INTF_TYPE rfInterface)
 {
     NfcTag& natTag = NfcTag::getInstance ();
 
-    if (natTag.mTechLibNfcTypes[0] != NFC_PROTOCOL_ISO_DEP)
+    if (sCurrentConnectedTargetProtocol != NFC_PROTOCOL_ISO_DEP)
     {
         ALOGD ("%s: protocol: %d not ISO_DEP, do nothing", __FUNCTION__, natTag.mTechLibNfcTypes[0]);
         return true;
@@ -685,17 +771,19 @@ static jint nativeNfcTag_doReconnect (JNIEnv*, jobject)
     }
 
     // special case for Kovio
-    if (NfcTag::getInstance ().mTechList [0] == TARGET_TYPE_KOVIO_BARCODE)
+    if (sCurrentConnectedTargetProtocol == TARGET_TYPE_KOVIO_BARCODE)
     {
         ALOGD ("%s: fake out reconnect for Kovio", __FUNCTION__);
         goto TheEnd;
     }
 
      // this is only supported for type 2 or 4 (ISO_DEP) tags
-    if (natTag.mTechLibNfcTypes[0] == NFA_PROTOCOL_ISO_DEP)
-        retCode = reSelect(NFA_INTERFACE_ISO_DEP, false);
-    else if (natTag.mTechLibNfcTypes[0] == NFA_PROTOCOL_T2T)
-        retCode = reSelect(NFA_INTERFACE_FRAME, false);
+    if (sCurrentConnectedTargetProtocol == NFA_PROTOCOL_ISO_DEP)
+        retCode = reSelect (NFA_INTERFACE_ISO_DEP, false);
+    else if (sCurrentConnectedTargetProtocol == NFA_PROTOCOL_T2T)
+        retCode = reSelect (NFA_INTERFACE_FRAME, false);
+    else if (sCurrentConnectedTargetProtocol == NFA_PROTOCOL_MIFARE)
+        retCode = reSelect (NFA_INTERFACE_MIFARE, false);
 
 TheEnd:
     ALOGD ("%s: exit 0x%X", __FUNCTION__, retCode);
@@ -772,6 +860,16 @@ void nativeNfcTag_doTransceiveStatus (tNFA_STATUS status, uint8_t* buf, uint32_t
 {
     SyncEventGuard g (sTransceiveEvent);
     ALOGD ("%s: data len=%d", __FUNCTION__, bufLen);
+
+    if (sCurrentConnectedTargetProtocol == NFA_PROTOCOL_MIFARE)
+    {
+       if (EXTNS_GetCallBackFlag () == FALSE)
+       {
+           EXTNS_MfcCallBack (buf, bufLen);
+           return;
+       }
+    }
+
     if (!sWaitingForTransceive)
     {
         ALOGE ("%s: drop data", __FUNCTION__);
@@ -812,13 +910,15 @@ void nativeNfcTag_notifyRfTimeout ()
 ** Returns:         Response from tag.
 **
 *******************************************************************************/
-static jbyteArray nativeNfcTag_doTransceive (JNIEnv* e, jobject, jbyteArray data, jboolean raw, jintArray statusTargetLost)
+static jbyteArray nativeNfcTag_doTransceive (JNIEnv* e, jobject o, jbyteArray data, jboolean raw, jintArray statusTargetLost)
 {
     int timeout = NfcTag::getInstance ().getTransceiveTimeout (sCurrentConnectedTargetType);
     ALOGD ("%s: enter; raw=%u; timeout = %d", __FUNCTION__, raw, timeout);
+
     bool waitOk = false;
     bool isNack = false;
     jint *targetLost = NULL;
+    tNFA_STATUS status;
 
     if (NfcTag::getInstance ().getActivationState () != NfcTag::Active)
     {
@@ -857,8 +957,17 @@ static jbyteArray nativeNfcTag_doTransceive (JNIEnv* e, jobject, jbyteArray data
             sWaitingForTransceive = true;
             sRxDataStatus = NFA_STATUS_OK;
             sRxDataBuffer.clear ();
-            tNFA_STATUS status = NFA_SendRawFrame (buf, bufLen,
-                    NFA_DM_DEFAULT_PRESENCE_CHECK_START_DELAY);
+
+            if (sCurrentConnectedTargetProtocol == NFA_PROTOCOL_MIFARE)
+            {
+                status = EXTNS_MfcTransceive (buf, bufLen);
+            }
+            else
+            {
+                status = NFA_SendRawFrame (buf, bufLen,
+                        NFA_DM_DEFAULT_PRESENCE_CHECK_START_DELAY);
+            }
+
             if (status != NFA_STATUS_OK)
             {
                 ALOGE ("%s: fail send; error=%d", __FUNCTION__, status);
@@ -901,6 +1010,28 @@ static jbyteArray nativeNfcTag_doTransceive (JNIEnv* e, jobject, jbyteArray data
                 ALOGD ("%s: try reconnect", __FUNCTION__);
                 nativeNfcTag_doReconnect (NULL, NULL);
                 ALOGD ("%s: reconnect finish", __FUNCTION__);
+            }
+            else if (sCurrentConnectedTargetProtocol == NFA_PROTOCOL_MIFARE)
+            {
+                uint32_t transDataLen = sRxDataBuffer.size ();
+                uint8_t *transData = (uint8_t *) sRxDataBuffer.data ();
+                if (EXTNS_CheckMfcResponse (&transData, &transDataLen) == NFCSTATUS_FAILED)
+                {
+                    nativeNfcTag_doReconnect (e, o);
+                }
+                else
+                {
+                    if (transDataLen != 0)
+                    {
+                        result.reset (e->NewByteArray (transDataLen));
+                    }
+                    if (result.get () != NULL)
+                    {
+                        e->SetByteArrayRegion (result.get (), 0, transDataLen, (const jbyte *) transData);
+                    }
+                    else
+                        ALOGE ("%s: Failed to allocate java byte array", __FUNCTION__);
+                }
             }
             else
             {
@@ -947,26 +1078,30 @@ static jint nativeNfcTag_doGetNdefType (JNIEnv*, jobject, jint libnfcType, jint 
 
     // For NFA, libnfcType is mapped to the protocol value received
     // in the NFA_ACTIVATED_EVT and NFA_DISC_RESULT_EVT event.
-    switch (libnfcType) {
-    case NFA_PROTOCOL_T1T:
+    if (NFA_PROTOCOL_T1T == libnfcType)
+    {
         ndefType = NDEF_TYPE1_TAG;
-        break;
-    case NFA_PROTOCOL_T2T:
-        ndefType = NDEF_TYPE2_TAG;;
-        break;
-    case NFA_PROTOCOL_T3T:
+    }
+    else if (NFA_PROTOCOL_T2T == libnfcType)
+    {
+        ndefType = NDEF_TYPE2_TAG;
+    }
+    else if (NFA_PROTOCOL_T3T == libnfcType)
+    {
         ndefType = NDEF_TYPE3_TAG;
-        break;
-    case NFA_PROTOCOL_ISO_DEP:
+    }
+    else if (NFA_PROTOCOL_ISO_DEP == libnfcType)
+    {
         ndefType = NDEF_TYPE4_TAG;
-        break;
-    case NFA_PROTOCOL_INVALID:
+    }
+    else if (NFA_PROTOCOL_MIFARE == libnfcType)
+    {
+        ndefType = NDEF_MIFARE_CLASSIC_TAG;
+    }
+    else
+    {
+        /* NFA_PROTOCOL_ISO15693, NFA_PROTOCOL_INVALID and others */
         ndefType = NDEF_UNKNOWN_TYPE;
-        break;
-    default:
-        /* NFA_PROTOCOL_ISO15693 and others */
-        ndefType = NDEF_UNKNOWN_TYPE;
-        break;
     }
     ALOGD ("%s: exit; ndef type=%d", __FUNCTION__, ndefType);
     return ndefType;
@@ -1062,7 +1197,7 @@ void nativeNfcTag_doCheckNdefResult (tNFA_STATUS status, uint32_t maxSize, uint3
 ** Returns:         Status code; 0 is success.
 **
 *******************************************************************************/
-static jint nativeNfcTag_doCheckNdef (JNIEnv* e, jobject, jintArray ndefInfo)
+static jint nativeNfcTag_doCheckNdef (JNIEnv* e, jobject o, jintArray ndefInfo)
 {
     tNFA_STATUS status = NFA_STATUS_FAILED;
     jint* ndef = NULL;
@@ -1070,7 +1205,7 @@ static jint nativeNfcTag_doCheckNdef (JNIEnv* e, jobject, jintArray ndefInfo)
     ALOGD ("%s: enter", __FUNCTION__);
 
     // special case for Kovio
-    if (NfcTag::getInstance ().mTechList [0] == TARGET_TYPE_KOVIO_BARCODE)
+    if (sCurrentConnectedTargetProtocol == TARGET_TYPE_KOVIO_BARCODE)
     {
         ALOGD ("%s: Kovio tag, no NDEF", __FUNCTION__);
         ndef = e->GetIntArrayElements (ndefInfo, 0);
@@ -1078,6 +1213,10 @@ static jint nativeNfcTag_doCheckNdef (JNIEnv* e, jobject, jintArray ndefInfo)
         ndef[1] = NDEF_MODE_READ_ONLY;
         e->ReleaseIntArrayElements (ndefInfo, ndef, 0);
         return NFA_STATUS_FAILED;
+    }
+    else if (sCurrentConnectedTargetProtocol == NFA_PROTOCOL_MIFARE)
+    {
+        nativeNfcTag_doReconnect (e, o);
     }
 
     /* Create the write semaphore */
@@ -1095,7 +1234,15 @@ static jint nativeNfcTag_doCheckNdef (JNIEnv* e, jobject, jintArray ndefInfo)
 
     ALOGD ("%s: try NFA_RwDetectNDef", __FUNCTION__);
     sCheckNdefWaitingForComplete = JNI_TRUE;
-    status = NFA_RwDetectNDef ();
+
+    if (sCurrentConnectedTargetProtocol == NFA_PROTOCOL_MIFARE)
+    {
+        status = EXTNS_MfcCheckNDef ();
+    }
+    else
+    {
+        status = NFA_RwDetectNDef ();
+    }
 
     if (status != NFA_STATUS_OK)
     {
@@ -1149,6 +1296,12 @@ static jint nativeNfcTag_doCheckNdef (JNIEnv* e, jobject, jintArray ndefInfo)
     {
         ALOGD ("%s: unknown status 0x%X", __FUNCTION__, sCheckNdefStatus);
         status = sCheckNdefStatus;
+    }
+
+    /* Reconnect Mifare Classic Tag for furture use */
+    if (sCurrentConnectedTargetProtocol == NFA_PROTOCOL_MIFARE)
+    {
+        nativeNfcTag_doReconnect (e, o);
     }
 
 TheEnd:
@@ -1216,7 +1369,7 @@ static jboolean nativeNfcTag_doPresenceCheck (JNIEnv*, jobject)
     // Special case for Kovio.  The deactivation would have already occurred
     // but was ignored so that normal tag opertions could complete.  Now we
     // want to process as if the deactivate just happened.
-    if (NfcTag::getInstance ().mTechList [0] == TARGET_TYPE_KOVIO_BARCODE)
+    if (sCurrentConnectedTargetProtocol == TARGET_TYPE_KOVIO_BARCODE)
     {
         ALOGD ("%s: Kovio, force deactivate handling", __FUNCTION__);
         tNFA_DEACTIVATED deactivated = {NFA_DEACTIVATE_TYPE_IDLE};
@@ -1253,6 +1406,14 @@ static jboolean nativeNfcTag_doPresenceCheck (JNIEnv*, jobject)
     {
         ALOGD ("%s: tag already deactivated", __FUNCTION__);
         return JNI_FALSE;
+    }
+    if (sCurrentConnectedTargetProtocol == NFA_PROTOCOL_MIFARE)
+    {
+        status = EXTNS_MfcPresenceCheck ();
+        if (status == NFCSTATUS_SUCCESS)
+        {
+            return (NFCSTATUS_SUCCESS == EXTNS_GetPresenceCheckStatus ()) ? JNI_TRUE : JNI_FALSE;
+        }
     }
 
     {
@@ -1292,7 +1453,8 @@ static jboolean nativeNfcTag_doIsNdefFormatable (JNIEnv* e,
 {
     jboolean isFormattable = JNI_FALSE;
     tNFC_PROTOCOL protocol = NfcTag::getInstance().getProtocol();
-    if (NFA_PROTOCOL_T1T == protocol || NFA_PROTOCOL_ISO15693 == protocol)
+    if (NFA_PROTOCOL_T1T == protocol || NFA_PROTOCOL_ISO15693 == protocol
+        || NFA_PROTOCOL_MIFARE == protocol)
     {
         isFormattable = JNI_TRUE;
     }
@@ -1374,6 +1536,53 @@ static jboolean nativeNfcTag_doIsIsoDepNdefFormatable (JNIEnv *e, jobject o, jby
 
 /*******************************************************************************
 **
+** Function:        nativeNfcTag_makeMifareNdefFormat
+**
+** Description:     Format a mifare classic tag so it can store NDEF message.
+**                  e: JVM environment.
+**                  o: Java object.
+**                  key: Key to acces tag.
+**                  keySize: size of Key.
+**
+** Returns:         True if ok.
+**
+*******************************************************************************/
+static jboolean nativeNfcTag_makeMifareNdefFormat (JNIEnv *e, jobject o, uint8_t *key, uint32_t keySize)
+{
+    ALOGD ("%s: enter", __FUNCTION__);
+    tNFA_STATUS status = NFA_STATUS_OK;
+
+    status = nativeNfcTag_doReconnect (e, o);
+    if (status != NFA_STATUS_OK)
+    {
+        ALOGD ("%s: reconnect error, status=%u", __FUNCTION__, status);
+        return JNI_FALSE;
+    }
+
+    sem_init (&sFormatSem, 0, 0);
+    sFormatOk = false;
+
+    status = EXTNS_MfcFormatTag (key, keySize);
+
+    if (status == NFA_STATUS_OK)
+    {
+        ALOGD ("%s: wait for completion", __FUNCTION__);
+        sem_wait (&sFormatSem);
+        status = sFormatOk ? NFA_STATUS_OK : NFA_STATUS_FAILED;
+    }
+    else
+    {
+        ALOGE ("%s: error status=%u", __FUNCTION__, status);
+    }
+
+    sem_destroy (&sFormatSem);
+    ALOGD ("%s: exit", __FUNCTION__);
+    return (status == NFA_STATUS_OK) ? JNI_TRUE : JNI_FALSE;
+}
+
+
+/*******************************************************************************
+**
 ** Function:        nativeNfcTag_doNdefFormat
 **
 ** Description:     Format a tag so it can store NDEF message.
@@ -1396,6 +1605,20 @@ static jboolean nativeNfcTag_doNdefFormat (JNIEnv *e, jobject o, jbyteArray)
         return JNI_FALSE;
     }
 
+    if (sCurrentConnectedTargetProtocol == NFA_PROTOCOL_MIFARE)
+    {
+        static uint8_t mfc_key1[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+        static uint8_t mfc_key2[6] = {0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7};
+        jboolean result;
+
+        result = nativeNfcTag_makeMifareNdefFormat (e, o, mfc_key1, sizeof(mfc_key1));
+        if (result == JNI_FALSE)
+        {
+            result = nativeNfcTag_makeMifareNdefFormat (e, o, mfc_key2, sizeof(mfc_key2));
+        }
+        return result;
+    }
+
     sem_init (&sFormatSem, 0, 0);
     sFormatOk = false;
     status = NFA_RwFormatTag ();
@@ -1409,7 +1632,7 @@ static jboolean nativeNfcTag_doNdefFormat (JNIEnv *e, jobject o, jbyteArray)
         ALOGE ("%s: error status=%u", __FUNCTION__, status);
     sem_destroy (&sFormatSem);
 
-    if (NfcTag::getInstance ().mTechLibNfcTypes[0] == NFA_PROTOCOL_ISO_DEP)
+    if (sCurrentConnectedTargetProtocol == NFA_PROTOCOL_ISO_DEP)
     {
         int retCode = NFCSTATUS_SUCCESS;
         retCode = nativeNfcTag_doReconnect (e, o);
@@ -1444,6 +1667,66 @@ void nativeNfcTag_doMakeReadonlyResult (tNFA_STATUS status)
 
 /*******************************************************************************
 **
+** Function:        nativeNfcTag_makeMifareReadonly
+**
+** Description:     Make the mifare classic tag read-only.
+**                  e: JVM environment.
+**                  o: Java object.
+**                  key: Key to access the tag.
+**                  keySize: size of Key.
+**
+** Returns:         True if ok.
+**
+*******************************************************************************/
+static jboolean nativeNfcTag_makeMifareReadonly (JNIEnv *e, jobject o, uint8_t *key, int32_t keySize)
+{
+    jboolean result = JNI_FALSE;
+    tNFA_STATUS status = NFA_STATUS_OK;
+
+    sMakeReadonlyStatus = NFA_STATUS_FAILED;
+
+    ALOGD ("%s", __FUNCTION__);
+
+    /* Create the make_readonly semaphore */
+    if (sem_init (&sMakeReadonlySem, 0, 0) == -1)
+    {
+        ALOGE ("%s: Make readonly semaphore creation failed (errno=0x%08x)", __FUNCTION__, errno);
+        return JNI_FALSE;
+    }
+
+    sMakeReadonlyWaitingForComplete = JNI_TRUE;
+
+    status = nativeNfcTag_doReconnect (e, o);
+    if (status != NFA_STATUS_OK)
+    {
+        goto TheEnd;
+    }
+
+    status = EXTNS_MfcSetReadOnly (key, keySize);
+    if (status != NFA_STATUS_OK)
+    {
+        goto TheEnd;
+    }
+    sem_wait (&sMakeReadonlySem);
+
+    if (sMakeReadonlyStatus == NFA_STATUS_OK)
+    {
+        result = JNI_TRUE;
+    }
+
+TheEnd:
+    /* Destroy semaphore */
+    if (sem_destroy (&sMakeReadonlySem))
+    {
+        ALOGE ("%s: Failed to destroy read_only semaphore (errno=0x%08x)", __FUNCTION__, errno);
+    }
+    sMakeReadonlyWaitingForComplete = JNI_FALSE;
+    return result;
+}
+
+
+/*******************************************************************************
+**
 ** Function:        nativeNfcTag_doMakeReadonly
 **
 ** Description:     Make the tag read-only.
@@ -1454,12 +1737,24 @@ void nativeNfcTag_doMakeReadonlyResult (tNFA_STATUS status)
 ** Returns:         True if ok.
 **
 *******************************************************************************/
-static jboolean nativeNfcTag_doMakeReadonly (JNIEnv*, jobject, jbyteArray)
+static jboolean nativeNfcTag_doMakeReadonly (JNIEnv *e, jobject o, jbyteArray)
 {
     jboolean result = JNI_FALSE;
     tNFA_STATUS status;
 
     ALOGD ("%s", __FUNCTION__);
+
+    if (sCurrentConnectedTargetProtocol == NFA_PROTOCOL_MIFARE)
+    {
+        static uint8_t mfc_key1[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+        static uint8_t mfc_key2[6] = {0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7};
+        result = nativeNfcTag_makeMifareReadonly (e, o, mfc_key1, sizeof(mfc_key1));
+        if (result == JNI_FALSE)
+        {
+            result = nativeNfcTag_makeMifareReadonly (e, o, mfc_key2, sizeof(mfc_key2));
+        }
+        return result;
+    }
 
     /* Create the make_readonly semaphore */
     if (sem_init (&sMakeReadonlySem, 0, 0) == -1)
@@ -1527,6 +1822,7 @@ void nativeNfcTag_registerNdefTypeHandler ()
     ALOGD ("%s", __FUNCTION__);
     sNdefTypeHandlerHandle = NFA_HANDLE_INVALID;
     NFA_RegisterNDefTypeHandler (TRUE, NFA_TNF_DEFAULT, (UINT8 *) "", 0, ndefHandlerCallback);
+    EXTNS_MfcRegisterNDefTypeHandler (ndefHandlerCallback);
 }
 
 
