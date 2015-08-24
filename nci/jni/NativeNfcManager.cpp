@@ -95,6 +95,7 @@ namespace android
     void                    doStartupConfig ();
     void                    startStopPolling (bool isStartPolling);
     void                    startRfDiscovery (bool isStart);
+    bool                    isDiscoveryStarted ();
 }
 
 
@@ -1244,6 +1245,7 @@ static jboolean nfcManager_doDeinitialize (JNIEnv*, jobject)
     sDiscoveryEnabled = false;
     sPollingEnabled = false;
     sIsDisabling = false;
+    sP2pEnabled = false;
     gActivated = false;
 
     {
@@ -1722,6 +1724,21 @@ void startRfDiscovery(bool isStart)
     {
         ALOGE ("%s: Failed to start/stop RF discovery; error=0x%X", __FUNCTION__, status);
     }
+}
+
+
+/*******************************************************************************
+**
+** Function:        isDiscoveryStarted
+**
+** Description:     Indicates whether the discovery is started.
+**
+** Returns:         True if discovery is started
+**
+*******************************************************************************/
+bool isDiscoveryStarted ()
+{
+    return sRfEnabled;
 }
 
 
