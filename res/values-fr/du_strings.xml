@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<resources xmlns:xliff="urn:oasis:names:tc:xliff:document:1.2">
+
+    <!-- Strings for a dialog informing the user a URL was read from an NFC tag, and allowing confirmation that they want to open it -->
+    <!-- Title of the dialog -->
+    <string name="title_confirm_url_open">Ouvrir le lien ?</string>
+    <!-- Summary text appearing before the URL -->
+    <string name="summary_confirm_url_open" product="tablet">Votre tablette a reçu un lien via NFC :</string>
+    <string name="summary_confirm_url_open" product="default">Votre téléphone a reçu un lien via NFC :</string>
+    <!-- Label for the button which causes the URL to be opened -->
+    <string name="action_confirm_url_open">Ouvrir le lien</string>
+</resources>
